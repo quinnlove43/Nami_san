@@ -1,49 +1,110 @@
 import os
-import json
 import requests
-import yt_dlp
-from flask import Flask, request
+import json
+import time
+from pytube import YouTube
+import subprocess
 
-TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-BASE_URL = f"https://api.telegram.org/bot{TOKEN}/"
+# Set up FFmpeg (Koyeb/Heroku Compatibility)
+FFMPEG_PATH = "/usr/bin/ffmpeg"
+if not os.path.exists(FFMPEG_PATH):
+    print("Downloading FFmpeg...")
+    os.system("wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz")
+    os.system("tar -xf ffmpeg-release-amd64-static.tar.xz")
+    os.system("mv ffmpeg-*-static/ffmpeg /usr/bin/ffmpeg")
 
-app = Flask(__name__)
+# Replace with your Telegram Bot Token
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Function to send a message
-def send_message(chat_id, text):
-    url = BASE_URL + "sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    requests.post(url, json=payload)
+FORMATS = ['Audio', '144p', '240p', '360p', '480p', '720p', '1080p', '1440p', '2160p']
 
-# Function to download a YouTube video
-def download_youtube_video(url, resolution):
-    ydl_opts = {
-        "format": f"bestvideo[height<={resolution}]+bestaudio/best",
-        "outtmpl": f"downloads/video.mp4",
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    return "downloads/video.mp4"
+def read_msg(offset):
+    data = {"offset": offset}
+    resp = requests.get(BASE_URL + '/getUpdates', data=data)
+    dataframe = resp.json()
 
-@app.route("/", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    
-    if "message" in data and "text" in data["message"]:
-        chat_id = data["message"]["chat"]["id"]
-        text = data["message"]["text"]
+    for i in dataframe["result"]:
+        try:
+            user_id = i["message"]["from"]["id"]
+            text = i["message"]["text"]
 
-        if text.startswith("https://youtu"):
-            send_message(chat_id, "Downloading video... Please wait.")
-            video_path = download_youtube_video(text, 1080)  # Default to 1080p
-            files = {"video": open(video_path, "rb")}
-            requests.post(BASE_URL + "sendVideo", data={"chat_id": chat_id}, files=files)
-            os.remove(video_path)
-        else:
-            send_message(chat_id, "Send a valid YouTube link.")
+            print(f"User Input: {text}")
+            yt = YouTube(text)
 
-    return "OK", 200
+            if len(yt.streams) > 0:
+                send_download(user_id, yt)
+            else:
+                send_message(user_id, 'Cannot download this video')
 
-# Flask app for webhook
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+        except:
+            try:
+                process_download(i)
+            except Exception as e:
+                print("Error:", e)
+
+    if dataframe["result"]:
+        return dataframe["result"][-1]["update_id"] + 1
+
+def send_download(user, yt):
+    keyboard = [[{"text": "Audio"}]]
+    resolutions = ["144p", "240p", "360p", "480p", "720p", "1080p", "1440p", "2160p"]
+
+    for res in resolutions:
+        if yt.streams.filter(res=res):
+            keyboard.append([{"text": res}])
+
+    send_message(user, "Select Download Option:", keyboard)
+
+def process_download(i):
+    user_id = i["message"]["from"]["id"]
+    text = i["message"]["text"]
+
+    yt = YouTube(get_last_url(user_id))
+    title = yt.title.replace(" ", "_").replace("/", "_")
+    username = str(user_id)
+
+    os.makedirs(username, exist_ok=True)
+
+    input_audio = f"{username}/{title}_audio"
+    audio = yt.streams.filter(abr='128kbps')[0].download(filename=input_audio)
+
+    if text == "Audio":
+        output_audio = f"{username}/{title}.mp3"
+        subprocess.call(["ffmpeg", "-i", input_audio, output_audio, "-y"])
+        os.remove(input_audio)
+        send_audio(user_id, output_audio)
+    else:
+        input_video = f"{username}/{title}_video"
+        video = yt.streams.filter(res=text)[0].download(filename=input_video)
+
+        output_video = f"{username}/{title}.mp4"
+        subprocess.call(["ffmpeg", "-i", input_video, "-i", input_audio, "-c", "copy", output_video, "-y"])
+        os.remove(input_video)
+        os.remove(input_audio)
+        send_video(user_id, output_video)
+
+def send_message(user, message, keyboard=None):
+    data = {"chat_id": user, "text": message}
+    if keyboard:
+        data["reply_markup"] = {"keyboard": keyboard, "resize_keyboard": True, "one_time_keyboard": True}
+    requests.post(BASE_URL + "/sendMessage", json=data)
+
+def send_audio(user, audio):
+    with open(audio, 'rb') as f:
+        requests.post(BASE_URL + "/sendAudio", data={"chat_id": user}, files={"audio": f})
+
+def send_video(user, video):
+    with open(video, 'rb') as f:
+        requests.post(BASE_URL + "/sendVideo", data={"chat_id": user}, files={"video": f})
+
+def get_last_url(user_id):
+    return "YOUR_LAST_YOUTUBE_URL"  # Modify this to store/retrieve URLs properly
+
+offset = 0
+while True:
+    try:
+        offset = read_msg(offset)
+    except Exception as e:
+        print("Main Loop Error:", e)
+    time.sleep(1)
